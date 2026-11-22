@@ -15,6 +15,7 @@ struct SurfaceHideConfig {
     width: u32,
     height: u32,
     exclusive_zone: i32,
+    keyboard: KeyboardInteractivity,
     margin_top: i32,
     margin_right: i32,
     margin_bottom: i32,
@@ -46,10 +47,21 @@ pub enum MonitorPolicy {
 }
 
 /// Keyboard interactivity mode for a layer surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardMode {
     None,
     OnDemand,
     Exclusive,
+}
+
+impl From<KeyboardMode> for KeyboardInteractivity {
+    fn from(mode: KeyboardMode) -> Self {
+        match mode {
+            KeyboardMode::None => KeyboardInteractivity::None,
+            KeyboardMode::OnDemand => KeyboardInteractivity::OnDemand,
+            KeyboardMode::Exclusive => KeyboardInteractivity::Exclusive,
+        }
+    }
 }
 
 /// A key identifier.
@@ -150,6 +162,8 @@ impl ShellInitializer {
             height: None,
             margin: (0, 0, 0, 0),
             exclusive_flag: false,
+            exclusive_zone: None,
+            keyboard: KeyboardInteractivity::default(),
             surface_names: self.surface_names.clone(),
             surface_configs: self.surface_configs.clone(),
         }
@@ -173,11 +187,32 @@ pub struct SurfaceInitializer {
     height: Option<u32>,
     margin: (i32, i32, i32, i32),
     exclusive_flag: bool,
+    exclusive_zone: Option<i32>,
+    keyboard: KeyboardInteractivity,
     surface_names: Vec<String>,
     surface_configs: HashMap<String, SurfaceHideConfig>,
 }
 
 impl SurfaceInitializer {
+    /// What `show()` restores for the surface being configured.
+    fn hide_config(&self) -> SurfaceHideConfig {
+        let zone = if self.exclusive_flag {
+            self.height.or(self.width).unwrap_or(0) as i32
+        } else {
+            self.exclusive_zone.unwrap_or(0)
+        };
+        SurfaceHideConfig {
+            width: self.width.unwrap_or(0),
+            height: self.height.unwrap_or(0),
+            exclusive_zone: zone,
+            keyboard: self.keyboard,
+            margin_top: self.margin.0,
+            margin_right: self.margin.1,
+            margin_bottom: self.margin.2,
+            margin_left: self.margin.3,
+        }
+    }
+
     /// Start configuring a new surface, finalizing the current one.
     pub fn surface(mut self, name: &str) -> Self {
         let prev_name = self.surface_names.last().cloned();
@@ -188,18 +223,8 @@ impl SurfaceInitializer {
             }
         }
         if let Some(prev) = prev_name {
-            let w = self.width.unwrap_or(0);
-            let h = self.height.unwrap_or(0);
-            let zone = if self.exclusive_flag { self.height.or(self.width).unwrap_or(0) as i32 } else { 0 };
-            self.surface_configs.insert(prev, SurfaceHideConfig {
-                width: w,
-                height: h,
-                exclusive_zone: zone,
-                margin_top: self.margin.0,
-                margin_right: self.margin.1,
-                margin_bottom: self.margin.2,
-                margin_left: self.margin.3,
-            });
+            let cfg = self.hide_config();
+            self.surface_configs.insert(prev, cfg);
         }
         self.surface_names.push(name.to_string());
         SurfaceInitializer {
@@ -208,6 +233,8 @@ impl SurfaceInitializer {
             height: None,
             margin: (0, 0, 0, 0),
             exclusive_flag: false,
+            exclusive_zone: None,
+            keyboard: KeyboardInteractivity::default(),
             surface_names: self.surface_names.clone(),
             surface_configs: self.surface_configs.clone(),
         }
@@ -252,6 +279,7 @@ impl SurfaceInitializer {
 
     /// Manually set an exclusive zone.
     pub fn exclusive_zone(mut self, zone: i32) -> Self {
+        self.exclusive_zone = Some(zone);
         self.inner = self.inner.exclusive_zone(zone);
         self
     }
@@ -280,9 +308,9 @@ impl SurfaceInitializer {
     }
 
     /// Set keyboard interactivity.
-    pub fn keyboard(self, mode: KeyboardMode) -> Self {
-        // todo: waiting on layer-shika exposure
-        let _ = mode;
+    pub fn keyboard(mut self, mode: KeyboardMode) -> Self {
+        self.keyboard = mode.into();
+        self.inner = self.inner.keyboard_interactivity(self.keyboard);
         self
     }
 
@@ -309,18 +337,8 @@ impl SurfaceInitializer {
             }
         }
         if let Some(name) = self.surface_names.last().cloned() {
-            let w = self.width.unwrap_or(0);
-            let h = self.height.unwrap_or(0);
-            let zone = if self.exclusive_flag { self.height.or(self.width).unwrap_or(0) as i32 } else { 0 };
-            self.surface_configs.insert(name, SurfaceHideConfig {
-                width: w,
-                height: h,
-                exclusive_zone: zone,
-                margin_top: self.margin.0,
-                margin_right: self.margin.1,
-                margin_bottom: self.margin.2,
-                margin_left: self.margin.3,
-            });
+            let cfg = self.hide_config();
+            self.surface_configs.insert(name, cfg);
         }
         let shell = self.inner.build().map_err(|e| HeliumError::Shell(e.to_string()))?;
         Ok(ShellInstance::new(shell, self.surface_names, self.surface_configs))
@@ -434,28 +452,69 @@ impl TickContext<'_> {
             .and_then(|s| s.component_instance().get_property(prop).ok())
     }
 
-    /// Hide a surface by pushing it off-screen and releasing its exclusive zone.
-    pub fn hide(&self, surface: &str) {
-        let handle = self.control.surface_by_name(surface);
-        let _ = handle.set_exclusive_zone(0);
-        let _ = handle.set_margins((0, 0, -10_000, 0));
+    /// Set a property of an exported Slint `global` on every instance of a
+    /// named surface (globals are per component instance).
+    pub fn set_global(&mut self, surface: &str, global: &str, prop: &str, value: impl IntoSlintValue) {
+        let value = value.into_slint_value();
+        for s in self.app_state.surfaces_by_name(surface) {
+            let _ = s
+                .component_instance()
+                .set_global_property(global, prop, value.clone());
+        }
     }
 
-    /// Show a previously hidden surface, restoring its original dimensions,
-    /// margins, and exclusive zone.
+    /// Hide a surface. See [`ShellInstance::hide`].
+    pub fn hide(&self, surface: &str) {
+        hide_surface(&self.control, surface);
+    }
+
+    /// Show a previously hidden surface. See [`ShellInstance::show`].
     pub fn show(&self, surface: &str) {
-        if let Some(cfg) = self.surface_configs.get(surface) {
-            let handle = self.control.surface_by_name(surface);
-            let _ = handle.resize(cfg.width, cfg.height);
-            let _ = handle.set_exclusive_zone(cfg.exclusive_zone);
-            let _ = handle.set_margins((cfg.margin_top, cfg.margin_right, cfg.margin_bottom, cfg.margin_left));
-        }
+        show_surface(&self.control, self.surface_configs, surface);
+    }
+
+    /// Raw layer-shika control, for what this wrapper doesn't cover
+    /// (per-surface resize, layer or keyboard changes, popups).
+    pub fn control(&self) -> ShellControl {
+        self.control.clone()
+    }
+}
+
+/// Shrinks a surface to 2x1 and releases its exclusive zone and keyboard
+/// focus.
+///
+/// Margins can't hide a layer surface: they only apply to the edges it is
+/// anchored to, so a surface anchored to the top stayed where it was. Not
+/// 1x1: layer-shika takes a requested width of 1 as the whole output's
+/// width.
+fn hide_surface(control: &ShellControl, surface: &str) {
+    let handle = control.surface_by_name(surface);
+    let _ = handle.set_exclusive_zone(0);
+    let _ = handle.set_keyboard_interactivity(KeyboardInteractivity::None);
+    let _ = handle.resize(2, 1);
+}
+
+/// Restores a surface's size, margins, exclusive zone and keyboard mode as
+/// configured in the builder.
+fn show_surface(
+    control: &ShellControl,
+    configs: &HashMap<String, SurfaceHideConfig>,
+    surface: &str,
+) {
+    if let Some(cfg) = configs.get(surface) {
+        let handle = control.surface_by_name(surface);
+        let _ = handle.resize(cfg.width, cfg.height);
+        let _ = handle.set_margins((cfg.margin_top, cfg.margin_right, cfg.margin_bottom, cfg.margin_left));
+        let _ = handle.set_exclusive_zone(cfg.exclusive_zone);
+        let _ = handle.set_keyboard_interactivity(cfg.keyboard);
     }
 }
 
 /// Lightweight handle passed into [`ShellInstance::on_ipc`] callbacks.
 pub struct IpcContext<'a> {
     app_state: &'a mut layer_shika_adapters::AppState,
+    control: ShellControl,
+    surface_configs: &'a HashMap<String, SurfaceHideConfig>,
 }
 
 impl IpcContext<'_> {
@@ -475,6 +534,32 @@ impl IpcContext<'_> {
             .surfaces_by_name(surface)
             .first()
             .and_then(|s| s.component_instance().get_property(prop).ok())
+    }
+
+    /// Set a property of an exported Slint `global` on every instance of a
+    /// named surface (globals are per component instance).
+    pub fn set_global(&mut self, surface: &str, global: &str, prop: &str, value: impl IntoSlintValue) {
+        let value = value.into_slint_value();
+        for s in self.app_state.surfaces_by_name(surface) {
+            let _ = s
+                .component_instance()
+                .set_global_property(global, prop, value.clone());
+        }
+    }
+
+    /// Hide a surface. See [`ShellInstance::hide`].
+    pub fn hide(&self, surface: &str) {
+        hide_surface(&self.control, surface);
+    }
+
+    /// Show a previously hidden surface. See [`ShellInstance::show`].
+    pub fn show(&self, surface: &str) {
+        show_surface(&self.control, self.surface_configs, surface);
+    }
+
+    /// Raw layer-shika control. See [`TickContext::control`].
+    pub fn control(&self) -> ShellControl {
+        self.control.clone()
     }
 }
 
@@ -653,11 +738,17 @@ impl ShellInstance {
         cb: impl FnMut(&mut IpcContext) + 'static,
     ) -> std::result::Result<(), HeliumError> {
         let handle = self.inner.event_loop_handle();
+        let control = self.inner.control();
+        let configs = self.surface_configs.clone();
         let cb = RefCell::new(cb);
         let fd_ref = FdRef(fd);
         handle
             .add_fd(fd_ref, Interest::READ, Mode::Level, move |app_state| {
-                let mut ctx = IpcContext { app_state };
+                let mut ctx = IpcContext {
+                    app_state,
+                    control: control.clone(),
+                    surface_configs: &configs,
+                };
                 let mut cb = cb.borrow_mut();
                 cb(&mut ctx);
             })
@@ -831,25 +922,32 @@ impl ShellInstance {
         self
     }
 
-    /// Hide a surface by pushing it off-screen and releasing its
-    /// exclusive zone.
+    /// Hide a surface: shrink it to 2x1 and release its exclusive zone and
+    /// keyboard focus. The surface stays mapped, so showing it again is
+    /// instant.
     pub fn hide(&mut self, surface: &str) {
-        let ctrl = self.inner.control();
-        let handle = ctrl.surface_by_name(surface);
-        let _ = handle.set_exclusive_zone(0);
-        let _ = handle.set_margins((0, 0, -10_000, 0));
+        hide_surface(&self.inner.control(), surface);
     }
 
-    /// Show a previously hidden surface, restoring its original dimensions,
-    /// margins, and exclusive zone.
+    /// Show a previously hidden surface, restoring its size, margins,
+    /// exclusive zone and keyboard mode.
     pub fn show(&mut self, surface: &str) {
-        if let Some(cfg) = self.surface_configs.get(surface).copied() {
-            let ctrl = self.inner.control();
-            let handle = ctrl.surface_by_name(surface);
-            let _ = handle.resize(cfg.width, cfg.height);
-            let _ = handle.set_exclusive_zone(cfg.exclusive_zone);
-            let _ = handle.set_margins((cfg.margin_top, cfg.margin_right, cfg.margin_bottom, cfg.margin_left));
-        }
+        show_surface(&self.inner.control(), &self.surface_configs, surface);
+    }
+
+    /// Set a property of an exported Slint `global` on a named surface.
+    pub fn set_global(&mut self, surface: &str, global: &str, prop: &str, value: impl IntoSlintValue) {
+        let value = value.into_slint_value();
+        let _ = self.inner.with_surface(surface, |comp| {
+            let _ = comp.set_global_property(global, prop, value.clone());
+        });
+    }
+
+    /// Raw layer-shika control, for what this wrapper doesn't cover
+    /// (per-surface resize, layer or keyboard changes, popups). Unlike
+    /// [`into_inner`](Self::into_inner), keeps the wrapper and its callbacks.
+    pub fn control(&self) -> ShellControl {
+        self.inner.control()
     }
 
     /// Hot-swap the `.slint` file for a surface without restarting the shell.
